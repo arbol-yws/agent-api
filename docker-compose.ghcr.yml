@@ -1,0 +1,36 @@
+# 使用已发布镜像（GHCR）启动，不本地构建。
+# 用法：docker compose -f docker-compose.ghcr.yml up -d
+# 本地构建方式仍见 docker-compose.yml，两者互不影响。
+services:
+  agent-api:
+    image: "${AGENT_API_IMAGE:-ghcr.io/arbol-yws/agent-api:latest}"
+    ports:
+      - "${AGENT_API_PORT:-8080}:8080"
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      ANTHROPIC_AUTH_TOKEN: "${ANTHROPIC_AUTH_TOKEN:-}"
+      ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL:-}"
+      SERVICE_API_KEY: "${SERVICE_API_KEY:-}"
+      CLAUDE_MODEL: "${CLAUDE_MODEL:-}"
+      CLAUDE_PERMISSION_MODE: "${CLAUDE_PERMISSION_MODE:-bypassPermissions}"
+      CLAUDE_INCLUDE_PARTIAL_MESSAGES: "${CLAUDE_INCLUDE_PARTIAL_MESSAGES:-true}"
+      MAX_CONCURRENT_TASKS: "${MAX_CONCURRENT_TASKS:-2}"
+      MAX_QUEUE_SIZE: "${MAX_QUEUE_SIZE:-32}"
+      TASK_TIMEOUT_MS: "${TASK_TIMEOUT_MS:-600000}"
+      MAX_TASK_TIMEOUT_MS: "${MAX_TASK_TIMEOUT_MS:-3600000}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - "${WORKSPACE_HOST_DIR:-./workspace}:/workspace"
+      - "${STATE_DIR_HOST:-./state}:/var/lib/agent-api"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

@@ -282,7 +282,7 @@ ${STATE_DIR}/
 
 ## 构建与启动
 
-### 方式一：docker compose（推荐）
+### 方式一：docker compose（本地构建，推荐）
 
 ```bash
 cd /Volumes/personal_folder/code/projects/agent-api
@@ -302,7 +302,31 @@ docker compose logs -f agent-api
 
 Linux 宿主如果遇到 `state/` 权限问题，执行 `sudo chown -R 10001:10001 state`。
 
-### 方式二：docker build / run
+### 方式二：docker compose（使用 GHCR 已发布镜像）
+
+`docker-compose.ghcr.yml` 直接拉取 CI 发布的镜像，不本地构建（卷、环境变量与方式一相同）：
+
+```bash
+cp .env.example .env   # 填入凭据
+mkdir -p workspace state
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+可用 `AGENT_API_IMAGE` 指定版本，默认 `ghcr.io/arbol-yws/agent-api:latest`：
+
+```bash
+AGENT_API_IMAGE=ghcr.io/arbol-yws/agent-api:sha-<短sha> \
+  docker compose -f docker-compose.ghcr.yml up -d
+```
+
+仓库为私有仓库时，拉取前需先登录 GHCR（需要 `read:packages` 权限的 GitHub token）：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
+```
+
+### 方式三：docker build / run
 
 ```bash
 docker build -t claude-code-agent-api:local \
@@ -330,11 +354,27 @@ docker run -d --name agent-api \
 - 镜像内已创建 `/var/lib/agent-api` 并 `chown` 给 `agent`，对应 `STATE_DIR`；挂载宿主
   `state/` 后即可持久化任务数据（容器删除重建不丢）。
 
-### 方式三：本地直接运行
+### 方式四：本地直接运行
 
 ```bash
 npm ci
 ANTHROPIC_API_KEY=... WORKSPACE_DIR=$PWD/workspace STATE_DIR=$PWD/state npm start
+```
+
+## 镜像发布（GitHub Actions → GHCR）
+
+[.github/workflows/docker.yml](.github/workflows/docker.yml) 在推送到 `master`（或手动
+`workflow_dispatch`）时自动构建并推送镜像：
+
+- 镜像：`ghcr.io/arbol-yws/agent-api`
+- 标签：`latest`（仅默认分支）与 `sha-<短 sha>`（每次提交）
+- 登录：使用内置 `GITHUB_TOKEN`（workflow 声明 `packages: write`），无需额外 secret
+- 缓存：BuildKit + GitHub Actions 缓存（`cache-from/cache-to: type=gha`），增量复用层
+
+拉取私有仓库的镜像前需要先登录：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
 ```
 
 ## 环境变量
