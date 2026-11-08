@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { loadConfig, describeCredentials } from './config.js';
+import { loadConfig, describeCredentials, ConfigError } from './config.js';
 import { createLogger } from './logger.js';
 import { TaskManager } from './tasks.js';
 import { TaskStore } from './taskStore.js';
@@ -28,11 +28,7 @@ export async function startServer({ env = process.env } = {}) {
   }
 
   const credentials = describeCredentials(config);
-  if (credentials.ok) {
-    logger.info('credentials detected', { source: credentials.source });
-  } else {
-    logger.warn('credentials missing', { reason: credentials.reason });
-  }
+  logger.info('credentials detected', { source: credentials.source });
 
   const manager = new TaskManager({ config, logger, store: taskStore });
   const app = createApp({ config, logger, manager, claudeCheck });
@@ -57,7 +53,16 @@ export async function startServer({ env = process.env } = {}) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const boot = await startServer();
+  let boot;
+  try {
+    boot = await startServer();
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      console.error(`[fatal] configuration error: ${error.message}`);
+      process.exit(1);
+    }
+    throw error;
+  }
   let shuttingDown = false;
 
   const shutdown = async (signal) => {

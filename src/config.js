@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 export class ConfigError extends Error {
@@ -50,6 +51,45 @@ const DEFAULT_PASSTHROUGH = [
   'CLAUDE_CONFIG_DIR',
 ];
 
+const CREDENTIAL_SETUP_HINT =
+  'ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL, or CLAUDE_CODE_USE_BEDROCK=1, or CLAUDE_CODE_USE_VERTEX=1';
+
+/**
+ * 仅当显式设置 ENV_FILE 时才读取指定文件，且不会覆盖已存在的环境变量。
+ * 服务运行不依赖 .env；未设置 ENV_FILE 时这里什么都不做。
+ */
+export function loadEnvFile(filePath, env = process.env) {
+  let text;
+  try {
+    text = fs.readFileSync(filePath, 'utf8');
+  } catch (error) {
+    throw new ConfigError(`ENV_FILE ${filePath} could not be read: ${error.message}`);
+  }
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!match) continue;
+    let value = match[2].trim();
+    if (value.length >= 2) {
+      const first = value[0];
+      const last = value[value.length - 1];
+      if ((first === '"' || first === "'") && last === first) value = value.slice(1, -1);
+    }
+    if (env[match[1]] === undefined) env[match[1]] = value;
+  }
+  return env;
+}
+
+/** 返回缺失的必需变量名；凭据有多种互斥的提供方式，只要求满足其中一种。 */
+export function collectMissingConfig(config) {
+  if (config.auth.apiKey) return [];
+  if (config.auth.useBedrock || config.auth.useVertex) return [];
+  if (config.auth.authToken) return config.auth.baseUrl ? [] : ['ANTHROPIC_BASE_URL'];
+  return ['ANTHROPIC_API_KEY'];
+}
+
 function readString(env, name, fallback = '') {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -93,6 +133,9 @@ function readArgs(env, name) {
 }
 
 export function loadConfig(env = process.env) {
+  // 可选：仅在显式指定 ENV_FILE 时加载本文件，作为本地开发的便利，不作为运行前提。
+  if (env.ENV_FILE) loadEnvFile(env.ENV_FILE, env);
+
   const workspaceDir = path.resolve(readString(env, 'WORKSPACE_DIR', '/workspace'));
   const claudeBin = readString(env, 'CLAUDE_BIN', 'claude');
   const permissionMode = readString(env, 'CLAUDE_PERMISSION_MODE', 'bypassPermissions');
@@ -149,6 +192,17 @@ export function loadConfig(env = process.env) {
       useVertex: readString(env, 'CLAUDE_CODE_USE_VERTEX', '') === '1',
     },
   };
+
+  const missing = collectMissingConfig(config);
+  if (missing.length > 0) {
+    const error = new ConfigError(
+      `Missing required environment variable(s): ${missing.join(', ')}. ` +
+        `Provide credentials via one of: ${CREDENTIAL_SETUP_HINT}. ` +
+        'Configuration is read from the process environment only (an optional ENV_FILE can be set explicitly).',
+    );
+    error.missing = missing;
+    throw error;
+  }
 
   return config;
 }
