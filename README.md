@@ -135,13 +135,12 @@ ANTHROPIC_API_KEY=... WORKSPACE_DIR=$PWD/workspace STATE_DIR=$PWD/state npm star
 - 标签：
   - `latest` — 仅默认分支
   - `yyMMddHHmm` — 构建时间，固定按 `Asia/Shanghai` 生成，例如 `2611082045`
-  - `sha-<短 sha>` — 对应提交，例如 `sha-0d5ca56`
 - 登录：内置 `GITHUB_TOKEN`（`packages: write`），无需额外 secret
 - 缓存：BuildKit + `type=gha` 缓存，增量复用构建层
 
 同一分支的构建串行执行（`concurrency`，不中断进行中的推送）。同一分钟内重复构建会得到
 相同的时间标签，后一次推送覆盖同名标签（registry 的标签推进是原子的，不会产生损坏镜像）；
-需要精确区分某次提交时使用 `sha-<短 sha>` 标签。
+具体构建对应的提交可在 Actions 的运行记录中查看。
 
 ## 环境变量
 
