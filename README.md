@@ -1,39 +1,198 @@
 # Claude Code Agent API
 
-把 Claude Code 的无头执行模式封装成 HTTP 任务服务：`POST` 下发任务后，通过 SSE 实时接收**过程内容**（助手文本增量、工具调用、工具结果、stderr 等），并在最后收到独立的**最终结果**事件。
+把 Claude Code 的无头执行模式（`claude -p`）封装成 HTTP 任务服务：`POST` 下发任务后，
+通过 SSE 实时接收**过程内容**（助手文本增量、工具调用、工具结果、stderr 等），并在最后
+收到独立的**最终结果**事件。
 
-服务基于 Node.js（Express 5），每个任务都启动一个真实的 `claude -p` 子进程，没有模拟实现。
+服务基于 Node.js（Express 5），每个任务启动一个真实的 `claude -p` 子进程，没有模拟实现。
 
-## 已验证的 Claude Code 行为
+## 能力
 
-在本机 Claude Code **2.1.236** 上实测确认（Docker 镜像固定安装 **2.1.319**，这些参数与输出格式一致）：
+- 任务异步下发：创建即返回 `202` 与 task id，按 id 查询状态与结果
+- 流式输出：SSE 区分过程事件（`process`）与最终结果（`result`），支持断线重连与事件重放
+- 并发与排队：`MAX_CONCURRENT_TASKS` 控制并发，超出进入 FIFO 队列，队列上限可配
+- 明确错误语义：认证失败、限流、上游错误、超时、取消、进程异常各有独立错误码
+- 持久化：任务元数据与事件落盘到 `STATE_DIR`，进程重启可恢复；重启前未结束的任务标记为失败
+- 可观测：`/healthz`、`/readyz`、`/v1/info`，JSON 行日志
+- 容器化：非 root 运行、内置 tini、健康检查、GHCR 自动发布
 
-```bash
-# 无头模式 + NDJSON 流式输出（stream-json 必须搭配 --verbose）
-claude -p --output-format stream-json --verbose --no-session-persistence
+## 架构与目录
 
-# 提示词通过 stdin 传入，避免 shell/argv 注入
-printf '%s\n' "你的任务" | claude -p --output-format stream-json --verbose
-
-# 更细粒度的增量输出
-claude -p --output-format stream-json --verbose --include-partial-messages
+```
+src/
+├── server.js       # 进程入口：加载配置、启动 HTTP、信号处理与优雅关闭
+├── config.js       # 环境变量解析与校验（缺必需项直接启动失败）
+├── app.js          # Express 路由、Bearer 鉴权、SSE 端点
+├── tasks.js        # 任务队列/并发控制/状态机/重启恢复
+├── taskStore.js    # STATE_DIR 落盘：meta.json 原子写 + events.jsonl 追加
+├── claude.js       # 启动 claude 子进程、参数拼装、NDJSON 解析、超时/取消
+├── normalize.js    # CLI 事件归一化为 process/result/error
+├── logger.js       # JSON 行日志
+└── errors.js       # 错误类型与 HTTP 映射
+test/               # Node 内置测试运行器的接口/持久化/配置测试
+Dockerfile          # node:22-bookworm-slim + 固定版本 claude-code，非 root
+docker-compose.yml  # 本地构建方式（build）
+docker-compose.ghcr.yml  # 使用 GHCR 已发布镜像（image）
+.github/workflows/docker.yml  # 推送 master 自动构建并发布镜像
 ```
 
-实测要点：
+请求处理链路：`app.js` 校验参数 → `tasks.js` 入队/调度 → `claude.js` 启动子进程并解析
+NDJSON → `normalize.js` 转成 SSE 事件 → `tasks.js` 广播并写盘 → `taskStore.js` 落盘。
 
-- `--output-format stream-json` **必须**同时给 `--verbose`，否则 CLI 直接报
-  `Error: When using --print, --output-format=stream-json requires --verbose`。
-- stdout 是逐行 JSON（NDJSON），主要事件：
-  - `{"type":"system","subtype":"init",...}`：会话初始化（模型、工具、权限模式等）
-  - `{"type":"assistant","message":{"content":[{"type":"text",...}]},...}`
-  - `{"type":"user","message":{"content":[{"type":"tool_result",...}]},...}`
-  - `{"type":"stream_event",...}`：配合 `--include-partial-messages` 的增量块
-  - `{"type":"result","is_error":...,"result":"...","subtype":"success",...}`：**终止事件**
-- 认证/接口失败时：CLI **退出码为 1**，且 result 事件里 `is_error: true`、带 `api_error_status`
-  （例如 `403`）。因此本服务同时依据 result 事件与退出码判定失败，不能只看退出码。
-- 提示词可直接从 stdin 读取；本服务均通过 stdin 下发。
-- 其他可用参数：`--permission-mode`、`--model`、`--max-budget-usd`、
-  `--allowedTools` / `--disallowedTools`、`--no-session-persistence`、`--bare`。
+### Claude Code 调用方式
+
+服务通过 stdin 下发提示词（避免 shell/argv 注入），参数包含
+`--output-format stream-json --verbose`（`stream-json` 在 `-p` 模式下必须搭配 `--verbose`）、
+`--no-session-persistence`、`--permission-mode`、可选的 `--model` / `--max-budget-usd` /
+`--allowedTools` 等，并按需加 `--include-partial-messages` 获取增量。
+
+CLI 的 stdout 是逐行 JSON（`system` / `assistant` / `user` / `stream_event` / `result`），
+其中 `result` 是终止事件。认证失败时 CLI 退出码为 1 且 `result.is_error` 为真，服务同时
+依据两者判定失败，避免只看退出码。
+
+## 构建与部署
+
+配置全部通过环境变量注入。运行时代码**只读进程环境变量**，不会隐式加载 `.env`。
+
+### 方式一：本地构建（docker compose）
+
+```bash
+cd /Volumes/personal_folder/code/projects/agent-api
+cp .env.example .env   # 仅供 compose 做 ${VAR} 插值，服务本身不读 .env
+# 编辑 .env，填入 ANTHROPIC_API_KEY（或 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL）
+mkdir -p workspace state
+docker compose up --build -d
+docker compose logs -f agent-api
+```
+
+compose 使用 `environment:` 显式注入，不使用 `env_file`；也可以不建 `.env`，直接
+`ANTHROPIC_API_KEY=... docker compose up --build -d`。
+
+卷映射：
+
+| 宿主路径（可覆盖） | 容器路径 | 说明 |
+| --- | --- | --- |
+| `./workspace`（`WORKSPACE_HOST_DIR`） | `/workspace` | 任务工作目录 |
+| `./state`（`STATE_DIR_HOST`） | `/var/lib/agent-api` | 任务元数据与 SSE 事件 |
+
+Linux 宿主如遇权限问题，执行 `sudo chown -R 10001:10001 state workspace`。
+
+### 方式二：使用 GHCR 已发布镜像
+
+```bash
+cp .env.example .env   # 填入凭据
+mkdir -p workspace state
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
+默认镜像为 `ghcr.io/arbol-yws/agent-api:latest`，可用 `AGENT_API_IMAGE` 指定版本：
+
+```bash
+AGENT_API_IMAGE=ghcr.io/arbol-yws/agent-api:2611082045 \
+  docker compose -f docker-compose.ghcr.yml up -d
+```
+
+仓库为私有仓库时，拉取前需登录 GHCR：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
+```
+
+### 方式三：docker build / docker run
+
+```bash
+docker build -t claude-code-agent-api:local \
+  --build-arg CLAUDE_CODE_VERSION=2.1.319 .
+
+mkdir -p "$PWD/workspace" "$PWD/state"
+docker run -d --name agent-api \
+  -p 8080:8080 \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -e MAX_CONCURRENT_TASKS=2 \
+  -v "$PWD/workspace:/workspace" \
+  -v "$PWD/state:/var/lib/agent-api" \
+  claude-code-agent-api:local
+```
+
+所有配置都用 `-e` 注入；缺少必需凭据时容器以退出码 `1` 结束，`docker logs` 会列出缺失变量。
+
+### 方式四：本地直接运行
+
+```bash
+npm ci
+ANTHROPIC_API_KEY=... WORKSPACE_DIR=$PWD/workspace STATE_DIR=$PWD/state npm start
+```
+
+本地开发如果想用文件保存配置，显式指定 `ENV_FILE=/path/to/file`，不设置则不读任何文件。
+
+### 镜像发布（GitHub Actions → GHCR）
+
+[.github/workflows/docker.yml](.github/workflows/docker.yml) 在 push 到 `master` 或手动
+`workflow_dispatch` 时构建并推送镜像：
+
+- 镜像：`ghcr.io/arbol-yws/agent-api`
+- 标签：
+  - `latest` — 仅默认分支
+  - `yyMMddHHmm` — 构建时间，固定按 `Asia/Shanghai` 生成，例如 `2611082045`
+  - `sha-<短 sha>` — 对应提交，例如 `sha-0d5ca56`
+- 登录：内置 `GITHUB_TOKEN`（`packages: write`），无需额外 secret
+- 缓存：BuildKit + `type=gha` 缓存，增量复用构建层
+
+同一分支的构建串行执行（`concurrency`，不中断进行中的推送）。同一分钟内重复构建会得到
+相同的时间标签，后一次推送覆盖同名标签（registry 的标签推进是原子的，不会产生损坏镜像）；
+需要精确区分某次提交时使用 `sha-<短 sha>` 标签。
+
+## 环境变量
+
+缺少必需配置时服务以退出码 `1` 退出，并在日志中列出缺失的变量名。
+
+| 变量 | 必需 | 默认值 | 作用 |
+| --- | --- | --- | --- |
+| `ANTHROPIC_API_KEY` 🔑 | 三选一 * | 空 | Anthropic API Key |
+| `ANTHROPIC_AUTH_TOKEN` 🔑 | 三选一 * | 空 | 网关/代理凭据，必须与 `ANTHROPIC_BASE_URL` 同时设置 |
+| `ANTHROPIC_BASE_URL` 🔑 | 三选一 * | 空 | 自定义 API 网关地址 |
+| `CLAUDE_CODE_USE_BEDROCK` 🔑 | 三选一 * | 空 | 设为 `1` 时使用 AWS Bedrock 凭据 |
+| `CLAUDE_CODE_USE_VERTEX` 🔑 | 三选一 * | 空 | 设为 `1` 时使用 Google Vertex 凭据 |
+| `SERVICE_API_KEY` 🔑 | 否 | 空 | 服务自身鉴权；设置后 `/v1` 需要 Bearer，对外暴露时建议必设 |
+| `PORT` | 否 | `8080` | HTTP 监听端口 |
+| `HOST` | 否 | `0.0.0.0` | HTTP 监听地址 |
+| `WORKSPACE_DIR` | 否 | `/workspace` | 任务工作目录根；每任务 `cwd` 必须在其内 |
+| `STATE_DIR` | 否 | `./state` | 任务元数据与 SSE 事件落盘目录（容器内为 `/var/lib/agent-api`） |
+| `STATE_DIR_HOST` | 否 | `./state` | 仅 docker compose：宿主 state 目录 |
+| `WORKSPACE_HOST_DIR` | 否 | `./workspace` | 仅 docker compose：宿主 workspace 目录 |
+| `AGENT_API_PORT` | 否 | `8080` | 仅 docker compose：宿主暴露端口 |
+| `AGENT_API_IMAGE` | 否 | `ghcr.io/arbol-yws/agent-api:latest` | 仅 `docker-compose.ghcr.yml`：使用的镜像 |
+| `ENV_FILE` | 否 | 空 | 显式指定时才读取的 env 文件（本地开发便利，不覆盖已有环境变量） |
+| `CLAUDE_BIN` | 否 | `claude` | CLI 可执行文件路径 |
+| `CLAUDE_HOME` | 否 | `$HOME` | 传给子进程的 `HOME`（CLI 会写 `.claude`） |
+| `CLAUDE_MODEL` | 否 | 空 | 默认模型（任务可用 `model` 覆盖） |
+| `CLAUDE_PERMISSION_MODE` | 否 | `bypassPermissions` | 无人值守执行所需；可按需收紧 |
+| `CLAUDE_INCLUDE_PARTIAL_MESSAGES` | 否 | `true` | 是否加 `--include-partial-messages` |
+| `CLAUDE_BARE` | 否 | `false` | 是否加 `--bare`（跳过用户配置/插件等） |
+| `CLAUDE_EXTRA_ARGS` | 否 | 空 | 额外 CLI 参数，按空格切分（不支持引号） |
+| `CLAUDE_ENV_PASSTHROUGH` | 否 | 见下 | 允许透传给子进程的环境变量名（逗号分隔） |
+| `CLAUDE_KILL_GRACE_MS` | 否 | `5000` | SIGTERM 到 SIGKILL 的宽限 |
+| `CLAUDE_STARTUP_CHECK` | 否 | `true` | 启动时是否探测 `claude` 可执行文件 |
+| `MAX_CONCURRENT_TASKS` | 否 | `2` | 同时运行的 CLI 进程数 |
+| `MAX_QUEUE_SIZE` | 否 | `32` | 等待队列上限，超出返回 `queue_full` |
+| `TASK_TIMEOUT_MS` | 否 | `600000` | 默认任务超时（从开始执行算起） |
+| `MAX_TASK_TIMEOUT_MS` | 否 | `3600000` | 请求里 `timeout_ms` 的上限 |
+| `MAX_EVENTS_PER_TASK` | 否 | `5000` | 每任务事件保留上限（超出仅保留实时推送） |
+| `SSE_MAX_BUFFER_BYTES` | 否 | `8388608` | 事件重放缓冲字节上限 |
+| `SSE_HEARTBEAT_MS` | 否 | `15000` | SSE 心跳间隔 |
+| `TASK_TTL_MS` | 否 | `0` | 终态任务保留时长；`0` 表示不自动清理，清理会同时删除磁盘数据 |
+| `BODY_LIMIT` | 否 | `512kb` | JSON 请求体上限 |
+| `LOG_LEVEL` | 否 | `info` | `debug` / `info` / `warn` / `error`（JSON 行日志） |
+| `TZ` | 否 | 系统默认 | 容器与日志时区（compose 默认 `Asia/Shanghai`） |
+
+\* 凭据必须满足下列之一：`ANTHROPIC_API_KEY`；或 `ANTHROPIC_AUTH_TOKEN` +
+`ANTHROPIC_BASE_URL`；或 `CLAUDE_CODE_USE_BEDROCK=1`；或 `CLAUDE_CODE_USE_VERTEX=1`。
+🔑 表示涉及凭据，请用 secret 管理方式注入，不要写进镜像或提交到仓库。
+
+`CLAUDE_ENV_PASSTHROUGH` 默认包含 `PATH`、`HOME`、`LANG`、`TZ`、`SHELL`、`ANTHROPIC_*`、
+`AWS_*`、`CLAUDE_CODE_USE_BEDROCK/VERTEX`、代理变量等；`SERVICE_API_KEY`、`PORT` 等
+**不会**透传给 Claude 子进程，避免凭据串用。
 
 ## 接口
 
@@ -42,13 +201,13 @@ claude -p --output-format stream-json --verbose --include-partial-messages
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/v1/tasks` | 创建任务并立即返回 `202`；任务进入队列/开始执行 |
+| `POST` | `/v1/tasks` | 创建任务并立即返回 `202` |
 | `GET` | `/v1/tasks/:id` | 查询状态与最终结果；`?include_events=1&from_seq=N` 可附带事件 |
-| `GET` | `/v1/tasks/:id/stream` | SSE 流；支持断线重连（`from_seq` / `Last-Event-ID`） |
+| `GET` | `/v1/tasks/:id/stream` | SSE 流；支持 `from_seq` / `Last-Event-ID` 续传 |
 | `POST` | `/v1/tasks/:id/cancel` | 取消排队或运行中的任务 |
 | `GET` | `/v1/tasks?limit=N` | 列出最近任务 |
 | `GET` | `/v1/info` | 运行统计与配置摘要（不含密钥） |
-| `GET` | `/healthz` | 存活检查（进程可响应即 200） |
+| `GET` | `/healthz` | 存活检查 |
 | `GET` | `/readyz` | 就绪检查：claude 二进制 + 凭据；未就绪返回 503 |
 
 ### 创建任务
@@ -85,14 +244,14 @@ curl -sS -X POST http://127.0.0.1:8080/v1/tasks \
 | --- | --- | --- |
 | `prompt` | string，必填 | 任务描述，最长 100000 字符；通过 stdin 传给 CLI |
 | `timeout_ms` | int | 任务超时（从开始执行算起），1000 ~ `MAX_TASK_TIMEOUT_MS` |
-| `model` | string | `--model` 的值，例如 `claude-sonnet-5` |
+| `model` | string | `--model` 的值 |
 | `permission_mode` | string | `default` / `acceptEdits` / `auto` / `bypassPermissions` / `manual` / `dontAsk` / `plan` |
 | `max_budget_usd` | number | 传给 `--max-budget-usd`，正数 |
-| `system_prompt` | string | 替换系统提示词（`--system-prompt`） |
+| `system_prompt` | string | 替换系统提示词 |
 | `allowed_tools` / `disallowed_tools` | string[] | 传给 `--allowedTools` / `--disallowedTools` |
 | `cwd` | string | 相对 `WORKSPACE_DIR` 的子目录；禁止绝对路径和越界 |
 
-### 流式调用（curl）
+### 流式调用
 
 ```bash
 TASK_ID=tsk_80023eb2-c250-40f3-9ef0-ef1f7b8b142a
@@ -101,14 +260,14 @@ curl -N -sS \
   "http://127.0.0.1:8080/v1/tasks/${TASK_ID}/stream"
 ```
 
-`-N` 关闭 curl 缓冲，事件会边产生边打印。断线后可用事件序号续传：
+`-N` 关闭 curl 缓冲，事件实时打印。断线后按序号续传：
 
 ```bash
 # 从第 5 条之后继续（或使用 Last-Event-ID: 5）
 curl -N -sS "http://127.0.0.1:8080/v1/tasks/${TASK_ID}/stream?from_seq=5"
 ```
 
-客户端断开默认**不会**取消任务；如希望断开即取消，追加 `&cancel_on_disconnect=1`。
+客户端断开默认**不会**取消任务；追加 `&cancel_on_disconnect=1` 可改为断开即取消。
 
 ### 查询状态 / 结果
 
@@ -166,12 +325,12 @@ curl -sS -H "Authorization: Bearer ${SERVICE_API_KEY}" \
 | `event` | 含义 |
 | --- | --- |
 | `status` | 状态迁移：`queued` → `running` → 终态 |
-| `process` | **过程内容**，`data.kind` 区分类型（见下表） |
-| `result` | **最终结果**（仅一次，`data.final: true`） |
+| `process` | 过程内容，`data.kind` 区分类型 |
+| `result` | 最终结果（仅一次，`data.final: true`） |
 | `error` | 失败语义（`code` / `message` / `details`） |
-| `end` | 流正常结束（客户端可据此关闭连接） |
+| `end` | 流正常结束 |
 
-`process` 事件的 `kind`：
+`process` 的 `kind`：
 
 | `kind` | 说明 |
 | --- | --- |
@@ -201,7 +360,7 @@ event: status   {"status":"succeeded",...}
 event: end      {"status":"succeeded"}
 ```
 
-失败时 `result` 不会出现，而是 `error` + 终态 `status`：
+失败时不会出现 `result`，而是 `error` + 终态 `status`：
 
 ```
 event: error    {"code":"claude_auth_failed","message":"Failed to authenticate...","details":{"api_error_status":403}}
@@ -234,16 +393,13 @@ HTTP 层错误统一返回 `{"error":{"code","message","details"}}`。
 | `timeout` | — | 超过 `timeout_ms`，进程被终止，状态 `timed_out` |
 | `cancelled` | — | 客户端取消，状态 `cancelled` |
 | `internal_error` | 500 | 服务内部异常 |
-| `server_restarted` | — | 服务重启时该任务仍处于 `queued`/`running`，已被判定失败 |
+| `server_restarted` | — | 服务重启时任务仍在 `queued`/`running`，判定为失败 |
 
-超时处理：先 `SIGTERM` 整个进程组，`CLAUDE_KILL_GRACE_MS` 后 `SIGKILL`，确保工具子进程一并回收。
+超时处理：先 `SIGTERM` 整个进程组，`CLAUDE_KILL_GRACE_MS` 后 `SIGKILL`，工具子进程一并回收。
 
 ## 数据持久化
 
-任务元数据与 SSE 事件都落盘到 `STATE_DIR`（默认 `./state`，容器内为 `/var/lib/agent-api`），
-进程重启不会丢任务。
-
-目录结构（每个任务一个目录）：
+任务元数据与 SSE 事件落盘到 `STATE_DIR`（默认 `./state`，容器内 `/var/lib/agent-api`）。
 
 ```
 ${STATE_DIR}/
@@ -253,211 +409,68 @@ ${STATE_DIR}/
         └── events.jsonl  # SSE 事件，一行一个，按 seq 递增追加
 ```
 
-写入的崩溃安全措施：
-
-- `meta.json` 采用「临时文件 + `fsync` + `rename`」原子替换，任何时刻磁盘上都是一份完整快照，
-  不会出现半截元数据。
-- `events.jsonl` 只按行追加（每行自带 `seq`）。启动加载时若发现文件尾部有写了一半的行
-  （进程在 `write` 中途被杀），会把它截断到最后一个换行符，只解析完整行，因此不会解析到
-  半条记录。
-- 事件与元数据在启动时按 `task_id` 重建内存任务表，并以磁盘上最后一条 `status`/`result`/
-  `error` 事件校正状态（例如元数据还停留在 `running`、但事件流已记录终态时以事件为准）。
-
-重启语义：
-
-- 服务启动时扫描 `STATE_DIR/tasks`，把所有任务重新载入。
-- 重启前处于 `queued` 或 `running` 的任务，其 `claude` 子进程已随进程消失，会被标记为
-  `failed`，错误码 `server_restarted`，`error.details.previous_status` 记录原状态；
-  同时补写一条 `error` 与终态 `status` 事件，因此重连 SSE 仍能拿到完整结果。
-- 已处于终态（`succeeded` / `failed` / `cancelled` / `timed_out`）的任务原样恢复，可继续
-  按 task id 查询、按 `from_seq` 重放事件。
+- `meta.json` 采用「临时文件 + `fsync` + `rename`」原子替换，磁盘上始终是完整快照。
+- `events.jsonl` 按行追加；启动加载时会把尾部未写完的行截断到最后一个换行符，只解析完整记录。
+- 启动时按 `task_id` 重建内存任务表，并用磁盘上最后一条 `status`/`result`/`error` 事件
+  校正状态（事件流已记录终态时以事件为准）。
+- 重启前处于 `queued`/`running` 的任务会被标记为 `failed`，错误码 `server_restarted`，
+  `error.details.previous_status` 记录原状态，并补写 `error` 与终态 `status` 事件。
+- 已处于终态的任务原样恢复，可继续按 id 查询、按 `from_seq` 重放事件。
 
 清理：
 
-- 设置 `TASK_TTL_MS > 0` 后，服务会定期清理超过该时长且无 SSE 订阅者的终态任务，
-  **同时删除内存条目与磁盘上的任务目录**，避免文件无限增长。
-- `TASK_TTL_MS=0`（默认）表示不自动清理，此时需要手工清理：
-  `rm -rf state/tasks/tsk_<uuid>`（或整目录 `rm -rf state/tasks/*`，建议在服务停止时执行）。
-- 任务目录按 uuid 命名，删除单个目录即可精准清理某个任务。
-
-## 构建与启动
-
-### 方式一：docker compose（本地构建，推荐）
-
-```bash
-cd /Volumes/personal_folder/code/projects/agent-api
-cp .env.example .env
-# 编辑 .env，填入 ANTHROPIC_API_KEY（或 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL）
-mkdir -p workspace state
-docker compose up --build -d
-docker compose logs -f agent-api
-```
-
-`docker-compose.yml` 的两个卷：
-
-| 宿主路径（可覆盖） | 容器路径 | 说明 |
-| --- | --- | --- |
-| `./workspace`（`WORKSPACE_HOST_DIR`） | `/workspace` | Claude 任务的工作目录 |
-| `./state`（`STATE_DIR_HOST`） | `/var/lib/agent-api` | 任务元数据与 SSE 事件，容器重建后仍在 |
-
-Linux 宿主如果遇到 `state/` 权限问题，执行 `sudo chown -R 10001:10001 state`。
-
-### 方式二：docker compose（使用 GHCR 已发布镜像）
-
-`docker-compose.ghcr.yml` 直接拉取 CI 发布的镜像，不本地构建（卷、环境变量与方式一相同）：
-
-```bash
-cp .env.example .env   # 填入凭据
-mkdir -p workspace state
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
-```
-
-可用 `AGENT_API_IMAGE` 指定版本，默认 `ghcr.io/arbol-yws/agent-api:latest`：
-
-```bash
-AGENT_API_IMAGE=ghcr.io/arbol-yws/agent-api:sha-<短sha> \
-  docker compose -f docker-compose.ghcr.yml up -d
-```
-
-仓库为私有仓库时，拉取前需先登录 GHCR（需要 `read:packages` 权限的 GitHub token）：
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
-```
-
-### 方式三：docker build / run
-
-```bash
-docker build -t claude-code-agent-api:local \
-  --build-arg CLAUDE_CODE_VERSION=2.1.319 .
-
-mkdir -p "$PWD/workspace" "$PWD/state"
-docker run -d --name agent-api \
-  -p 8080:8080 \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  -e MAX_CONCURRENT_TASKS=2 \
-  -v "$PWD/workspace:/workspace" \
-  -v "$PWD/state:/var/lib/agent-api" \
-  claude-code-agent-api:local
-```
-
-镜像说明：
-
-- 基础镜像 `node:22-bookworm-slim`，全局安装固定版本 `@anthropic-ai/claude-code@2.1.319`。
-- 以非 root 用户 `agent`（uid/gid `10001`）运行；`HOME=/home/agent`。
-- 内置 `tini` 作为 PID 1 并负责转发信号与回收僵尸进程；**不要**再加 `--init`
-  （会与内置 tini 重复初始化）。
-- Docker `HEALTHCHECK` 轮询 `/healthz`，容器状态显示 `healthy`。
-- 宿主 `workspace/` 目录会被挂载到容器 `/workspace`。Linux 宿主如遇写入权限问题，
-  执行 `sudo chown -R 10001:10001 workspace`。
-- 镜像内已创建 `/var/lib/agent-api` 并 `chown` 给 `agent`，对应 `STATE_DIR`；挂载宿主
-  `state/` 后即可持久化任务数据（容器删除重建不丢）。
-
-### 方式四：本地直接运行
-
-```bash
-npm ci
-ANTHROPIC_API_KEY=... WORKSPACE_DIR=$PWD/workspace STATE_DIR=$PWD/state npm start
-```
-
-## 镜像发布（GitHub Actions → GHCR）
-
-[.github/workflows/docker.yml](.github/workflows/docker.yml) 在推送到 `master`（或手动
-`workflow_dispatch`）时自动构建并推送镜像：
-
-- 镜像：`ghcr.io/arbol-yws/agent-api`
-- 标签：`latest`（仅默认分支）与 `sha-<短 sha>`（每次提交）
-- 登录：使用内置 `GITHUB_TOKEN`（workflow 声明 `packages: write`），无需额外 secret
-- 缓存：BuildKit + GitHub Actions 缓存（`cache-from/cache-to: type=gha`），增量复用层
-
-拉取私有仓库的镜像前需要先登录：
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u <你的 GitHub 用户名> --password-stdin
-```
-
-## 环境变量
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ANTHROPIC_API_KEY` | 空 | Anthropic API Key；与下面两项二选一 |
-| `ANTHROPIC_AUTH_TOKEN` | 空 | 网关/代理凭据，需配合 `ANTHROPIC_BASE_URL` |
-| `ANTHROPIC_BASE_URL` | 空 | 自定义 API 网关地址 |
-| `CLAUDE_CODE_USE_BEDROCK` / `..._VERTEX` | 空 | 使用云厂商凭据时设为 `1` |
-| `SERVICE_API_KEY` | 空 | 设置后 `/v1` 需要 Bearer 鉴权；建议对外暴露时必设 |
-| `PORT` / `HOST` | `8080` / `0.0.0.0` | 监听地址 |
-| `WORKSPACE_DIR` | `/workspace` | 任务工作目录根；每任务 `cwd` 必须在其内 |
-| `STATE_DIR` | `./state` | 任务元数据与 SSE 事件落盘目录（容器内为 `/var/lib/agent-api`） |
-| `STATE_DIR_HOST` | `./state` | 仅 docker compose 生效：宿主 state 目录映射到容器 `/var/lib/agent-api` |
-| `CLAUDE_HOME` | `$HOME` | 传给子进程的 `HOME`（CLI 会写 `.claude`） |
-| `CLAUDE_BIN` | `claude` | CLI 可执行文件路径 |
-| `CLAUDE_MODEL` | 空 | 默认模型（任务可用 `model` 覆盖） |
-| `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | 容器内无人值守执行所需；可按需收紧 |
-| `CLAUDE_INCLUDE_PARTIAL_MESSAGES` | `true` | 是否加 `--include-partial-messages` |
-| `CLAUDE_BARE` | `false` | 是否加 `--bare`（跳过用户配置/插件等） |
-| `CLAUDE_EXTRA_ARGS` | 空 | 额外 CLI 参数，按空格切分（不支持引号） |
-| `CLAUDE_ENV_PASSTHROUGH` | 见下 | 允许透传给子进程的环境变量名（逗号分隔） |
-| `CLAUDE_KILL_GRACE_MS` | `5000` | SIGTERM 到 SIGKILL 的宽限 |
-| `MAX_CONCURRENT_TASKS` | `2` | 同时运行的 CLI 进程数 |
-| `MAX_QUEUE_SIZE` | `32` | 等待队列上限，超出返回 `queue_full` |
-| `TASK_TIMEOUT_MS` | `600000` | 默认任务超时（从开始执行算起） |
-| `MAX_TASK_TIMEOUT_MS` | `3600000` | 请求里 `timeout_ms` 的上限 |
-| `MAX_EVENTS_PER_TASK` | `5000` | 每任务事件保留上限（超出仅保留实时推送） |
-| `SSE_MAX_BUFFER_BYTES` | `8388608` | 事件重放缓冲字节上限 |
-| `SSE_HEARTBEAT_MS` | `15000` | SSE 心跳间隔 |
-| `TASK_TTL_MS` | `0` | 终态任务保留时长；`0` 表示不自动清理。清理会同时删除内存与磁盘数据 |
-| `BODY_LIMIT` | `512kb` | JSON 请求体上限 |
-| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`（JSON 行日志） |
-
-`CLAUDE_ENV_PASSTHROUGH` 默认包含 `PATH`、`HOME`、`LANG`、`TZ`、`SHELL`、
-`ANTHROPIC_*`、`AWS_*`、`CLAUDE_CODE_USE_BEDROCK/VERTEX`、代理变量等。
-`SERVICE_API_KEY`、`PORT` 等**不会**透传给 Claude 子进程，避免凭据串用。
+- `TASK_TTL_MS > 0` 时定期清理超期且无 SSE 订阅者的终态任务，同时删除内存与磁盘数据。
+- `TASK_TTL_MS=0`（默认）不自动清理，可手工删除：`rm -rf state/tasks/tsk_<uuid>`。
 
 ## 并发、超时与连接语义
 
-- 任务创建后进入 FIFO 队列；运行数达到 `MAX_CONCURRENT_TASKS` 时状态为 `queued`，
+- 任务创建后进入 FIFO 队列；达到 `MAX_CONCURRENT_TASKS` 时状态为 `queued`，
   `queue_position` 给出排队位置。
-- 超时从任务**开始执行**时计算，不包含排队时间。
+- 超时从任务开始执行时计算，不包含排队时间。
 - SSE 断线只解除订阅，任务继续执行；重连时用 `from_seq`（或 `Last-Event-ID`）补齐事件。
-  需要断开即取消时用 `cancel_on_disconnect=1`。
-- 终态事件之后服务会发送 `end` 并关闭 SSE，客户端不会无限挂起。
-- 任务状态与事件保存在内存中，同时逐条落盘到 `STATE_DIR`；进程重启后自动从磁盘重建，
-  重启前未结束的任务会被标记为 `failed`（`server_restarted`）。详见「数据持久化」。
-- `TASK_TTL_MS` 控制终态任务的保留时长，清理时内存与磁盘一并删除。
+- 终态事件之后服务发送 `end` 并关闭 SSE，客户端不会无限挂起。
 
 ## 安全与运维
 
-- 容器内默认 `bypassPermissions`，Claude 可自主执行工具。请只在受控容器/网络中使用，
+- 容器内默认 `bypassPermissions`，Claude 可自主执行工具；只在受控容器/网络中使用，
   并对 `workspace/` 采用最小权限挂载。
-- 服务不写死任何密钥；凭据只从环境变量读取，且不会透传给子进程之外的地方。
-- 若服务需要跨机器访问，务必设置 `SERVICE_API_KEY` 并置于 TLS 反向代理之后。
-- 每次任务都是独立的 `claude -p` 进程，并带 `--no-session-persistence`，
-  不会复用/污染历史会话。
-- 建议为容器设置 CPU/内存限制（例如 `--cpus=2 --memory=4g`），避免并发任务耗尽资源。
+- 服务不写死密钥，凭据只从环境变量读取，且仅按白名单透传给子进程。
+- 跨机器访问时务必设置 `SERVICE_API_KEY` 并置于 TLS 反向代理之后。
+- 每次任务都是独立的 `claude -p` 进程并带 `--no-session-persistence`，不复用历史会话。
+- 建议为容器设置 CPU/内存限制（如 `--cpus=2 --memory=4g`），避免并发任务耗尽资源。
 
-## 本地测试
-
-测试直接调用真实的 `claude` 二进制（使用一个无效 API Key 验证认证失败的完整链路），
-覆盖健康检查、参数校验、SSE、断线重放、并发排队、取消、超时、队列上限，以及
-持久化相关的三项验证：重启后任务与事件仍可查询/重放、`running` 任务被标记
-`server_restarted`、TTL 到期后内存与磁盘同步删除。
+## 开发与测试
 
 ```bash
 npm ci
 npm test
 ```
 
-要求：本机已安装 `claude`，且能访问 Anthropic API（失败会快速返回，不会挂起）。
+测试使用 Node 内置测试运行器，会启动真实的 `claude` 子进程；运行前请确保 `claude`
+在 `PATH` 中。
 
-## 验证范围
+## 常见问题
 
-- 无头参数、NDJSON 事件结构、`--verbose` 强制要求、stdin 传参、退出码与
-  `is_error` 组合语义：已在 Claude Code 2.1.236 上实测。
-- 容器内 2.1.319 的 `/healthz`、`/readyz`、创建任务、SSE 过程事件与错误终态：
-  已实际构建并运行验证。
-- 文件持久化（`STATE_DIR` 落盘、重启恢复、`server_restarted` 标记、TTL 磁盘清理）：
-  已在本地测试中实测通过（12/12）。
-- 成功执行（`succeeded`）路径需要真实有效的凭据才能端到端跑通；本环境未配置有效
-  凭据，因此验证覆盖到「真实调用 → 认证失败 → 明确错误语义」为止。配置真实 Key 后
-  无需改代码即可跑通成功路径。
+**启动即退出，日志提示 `Missing required environment variable(s)`**
+没有提供可用凭据。按环境变量表设置 `ANTHROPIC_API_KEY`，或
+`ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`，或启用 Bedrock/Vertex。
+
+**任务失败且错误码为 `claude_auth_failed`**
+上游返回 401/403，通常是 Key 无效、过期或网关 token 不匹配。
+
+**重启后任务变成 `failed` / `server_restarted`**
+任务进程随服务重启消失，属于预期行为；可从 `events.jsonl` 查看重启前已产生的事件。
+
+**查询任务返回 `task_not_found`**
+任务不存在，或已超过 `TASK_TTL_MS` 被清理。
+
+**拉取 GHCR 镜像提示未授权**
+仓库为私有，先执行 `docker login ghcr.io`（token 需 `read:packages` 权限）。
+
+**Linux 上容器无法写入 `state/` 或 `workspace/`**
+宿主目录归属与容器内 uid `10001` 不一致，执行
+`sudo chown -R 10001:10001 state workspace`。
+
+**设置了 `.env` 但服务没读到**
+服务不隐式加载 `.env`；该文件只用于 compose 的 `${VAR}` 插值。本地运行请导出环境变量，
+或显式设置 `ENV_FILE`。
