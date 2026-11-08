@@ -1,0 +1,29 @@
+# 依赖
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 本地环境变量 / 密钥（保留示例文件）
+.env
+.env.*
+!.env.example
+
+# 运行时数据：任务元数据与 SSE 事件（STATE_DIR 默认 ./state）
+state/
+
+# Claude 任务工作目录（挂载卷，运行时产物）
+workspace/
+
+# 日志与临时文件
+logs/
+*.log
+*.tmp
+*.pid
+tmp/
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
